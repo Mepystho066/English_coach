@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# english-coach backend - environment template
+# Copy to `.env` and fill in real values. `.env` is git-ignored.
+# ---------------------------------------------------------------------------
+
+# --- LLM (OpenAI-compatible; e.g. LM Studio / Ollama / vLLM) ----------------
+LLM_BASE_URL=http://127.0.0.1:1234/v1
+LLM_BASE_MODEL=localmodel
+# Some local servers require any non-empty key; cloud providers require the real one.
+LLM_API_KEY=local
+LLM_TEMPERATURE=0.7
+# Which backend answers: fallback (local, then OpenRouter) | local | openrouter
+LLM_PROVIDER=fallback
+
+# --- OpenRouter (cloud model, used by LLM_PROVIDER=fallback/openrouter) ------
+# Canonical name; the bare `OPEN_ROUTER` variable is also accepted for the key.
+OPEN_ROUTER_API_KEY=
+OPEN_ROUTER_URL=https://openrouter.ai/api/v1
+# Model ids are namespaced. The `:free` variants are rate limited by OpenRouter
+# (20 req/min, and 50 req/day unless at least 10 credits were purchased).
+OPEN_ROUTER_MODEL=recursive/flint-v1.0:free
+# Optional attribution headers OpenRouter uses for its model rankings.
+OPEN_ROUTER_APP_TITLE=english-coach
+OPEN_ROUTER_APP_URL=
+
+# --- AssemblyAI (streaming STT) --------------------------------------------
+ASSEMBLYAI_API_KEY=
+ASSEMBLYAI_SPEECH_MODEL=universal-3-6-pro
+ASSEMBLYAI_SAMPLE_RATE=16000
+ASSEMBLYAI_ENCODING=pcm_s16le
+# Turn detection tuning (milliseconds / confidence 0..1).
+# `MIN_TURN_SILENCE` is the silence before a *speculative* end-of-turn check.
+# Too low (the old 120) and every thinking pause ends the user's turn, so a
+# sentence with "medias" is answered one fragment at a time. 300-400 is a good
+# value. `MAX_TURN_SILENCE` force-ends the turn regardless of punctuation.
+ASSEMBLYAI_MIN_TURN_SILENCE=350
+ASSEMBLYAI_MAX_TURN_SILENCE=2000
+# Only applies to the universal-streaming-* models, NOT to universal-3-*. It is
+# silently ignored (and useless) with the default model below.
+ASSEMBLYAI_END_OF_TURN_CONFIDENCE_THRESHOLD=
+
+# --- ElevenLabs (streaming TTS) --------------------------------------------
+ELEVENLABS_API_KEY=
+ELEVENLABS_VOICE_ID=
+ELEVENLABS_MODEL_ID=eleven_flash_v2_5
+# Must be raw PCM so the browser can play the frames without decoding.
+# One of: pcm_8000, pcm_16000, pcm_22050, pcm_24000, pcm_44100, pcm_48000
+ELEVENLABS_OUTPUT_FORMAT=pcm_24000
+# Comma-separated, each item between 1 and 500; lower values = lower latency,
+# lower quality. ElevenLabs closes the socket (1008) above 500.
+ELEVENLABS_CHUNK_SCHEDULE=50,120,200,300
+ELEVENLABS_BASE_URL=wss://api.elevenlabs.io
+
+# --- Voice pipeline ---------------------------------------------------------
+VOICE_MAX_SESSION_SECONDS=900
+VOICE_INPUT_SAMPLE_RATE=16000
+VOICE_OUTPUT_SAMPLE_RATE=24000
+# Extra silence to wait before answering, so fragments split by a natural pause
+# are answered together instead of cancelling each other. Added on top of
+# ASSEMBLYAI_MIN_TURN_SILENCE.
+VOICE_TURN_GRACE_MS=500
+
+# --- Session store ----------------------------------------------------------
+SESSION_TTL_SECONDS=3600
+SESSION_MAX_TURNS=100
+
+# --- HTTP -------------------------------------------------------------------
+APP_ENV=development
+APP_LOG_LEVEL=INFO
+# Comma-separated list, or `*` for any origin (dev only)
+APP_CORS_ORIGINS=http://localhost:3000,http://localhost:5173

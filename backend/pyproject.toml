@@ -1,0 +1,42 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "mepystho066", email = "mepystho06@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "assemblyai>=0.50",
+    "fastapi[standard]>=0.148.0",
+    "orjson>=3.13.0",
+    "pydantic-ai>=2.57.0",
+    "pydantic-ai-slim[ag-ui,openai]>=2.57.0",
+    "pydantic-settings>=2.16.0",
+    "python-dotenv>=1.2.4",
+    "uvicorn[standard]>=0.54.0",
+    "websockets>=16.1.1",
+]
+
+[project.scripts]
+backend = "app.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "."
+module-name = "app"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
