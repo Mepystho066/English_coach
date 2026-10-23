@@ -20,7 +20,7 @@ from app.core.config import settings
 if TYPE_CHECKING:
     from pydantic_ai.models import Model
 
-_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "English_coach.md"
+_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "test.md"
 
 _VOICE_ADDENDUM = """
 

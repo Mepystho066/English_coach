@@ -8,9 +8,10 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "assemblyai>=0.50",
     "fastapi[standard]>=0.148.0",
+    "httpx>=0.28.1",
     "orjson>=3.13.0",
+    "pipecat-ai>=1.13,<2",
     "pydantic-ai>=2.57.0",
     "pydantic-ai-slim[ag-ui,openai]>=2.57.0",
     "pydantic-settings>=2.16.0",
@@ -32,7 +33,6 @@ module-name = "app"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]

@@ -54,11 +54,7 @@ def test_settings() -> Settings:
         elevenlabs=ElevenLabsSettings(
             _env_file=None, api_key="test-elevenlabs-key", voice_id="test-voice"
         ),
-        voice=VoiceSettings(
-            _env_file=None,
-            # Short enough to keep the suite fast, long enough to be observable.
-            turn_grace_ms=30,
-        ),
+        voice=VoiceSettings(_env_file=None),
         session=SessionSettings(_env_file=None),
         app=AppSettings(_env_file=None),
     )

@@ -9,9 +9,10 @@ interface VoiceIndicatorsProps {
 export function VoiceIndicators({ micPermission, connectionQuality }: VoiceIndicatorsProps) {
   return (
     <div className="flex flex-wrap gap-2 justify-center px-4">
-      <AnimatePresence>
+      <AnimatePresence mode="sync">
         {micPermission === 'denied' && (
           <motion.div
+            key="mic-denied"
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
@@ -25,6 +26,7 @@ export function VoiceIndicators({ micPermission, connectionQuality }: VoiceIndic
         )}
         {micPermission === 'prompt' && (
           <motion.div
+            key="mic-prompt"
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
@@ -38,6 +40,7 @@ export function VoiceIndicators({ micPermission, connectionQuality }: VoiceIndic
         )}
         {connectionQuality === 'weak' && (
           <motion.div
+            key="conn-weak"
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
@@ -51,6 +54,7 @@ export function VoiceIndicators({ micPermission, connectionQuality }: VoiceIndic
         )}
         {connectionQuality === 'reconnecting' && (
           <motion.div
+            key="conn-reconnecting"
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}

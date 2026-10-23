@@ -4,12 +4,18 @@ import path from 'path'
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  server:{
+    allowedHosts: [
+      'jazmine-schoolgirlish-eda.ngrok-free.dev'
+    ]
+  },
   plugins: [react()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
     },
   },
+
   build: {
     outDir: '../backend/static',
     emptyOutDir: true,

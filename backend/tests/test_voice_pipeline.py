@@ -1,561 +1,351 @@
-"""End-to-end tests for the voice pipeline using fake providers and socket."""
+"""Unit tests for the Pipecat voice pipeline wiring (no network access)."""
 
 from __future__ import annotations
 
-import asyncio
-import json
-from collections.abc import AsyncIterator
-
+import httpx
 import pytest
-from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+)
+from pipecat.processors.frameworks.rtvi import RTVIProcessor
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.utils.types import NotGiven
 
-from app.agents.coach import build_coach_agent
-from app.agents.deps import AgentDeps
-from app.services.stt.base import SttSpeechStarted
-from app.services.voice.pipeline import VoiceSession
-from app.sessions.store import InMemorySessionStore
-from tests.fakes import FakeSTT, FakeTTSFactory, FakeWebSocket, make_turn
-
-pytestmark = pytest.mark.asyncio
-
-
-def _render_history(history) -> str:
-    """Flatten a pydantic-ai history into a searchable string.
-
-    `ModelMessage` types are dataclasses (not pydantic models), so there is no
-    `model_dump`; walking the parts is the portable way to assert on content.
-    """
-    chunks: list[str] = []
-    for message in history:
-        chunks.append(type(message).__name__)
-        for part in getattr(message, "parts", ()):
-            content = getattr(part, "content", None)
-            if isinstance(content, str):
-                chunks.append(content)
-            elif content is not None:
-                chunks.append(str(content))
-    return "\n".join(chunks)
+from app.agents.coach import load_instructions
+from app.agents.model import OPENROUTER_BASE_URL
+from app.core.config import AssemblyAISettings, OpenRouterSettings
+from app.services.voice.llm import (
+    build_local_llm,
+    build_voice_llm,
+    local_model_usable,
+)
+from app.services.voice.pipecat_pipeline import (
+    _assemblyai_settings,
+    build_context,
+    build_pipeline,
+    build_stt,
+    build_transport,
+    build_tts,
+)
 
 
-def _build_session(
-    *,
-    agent: Agent[AgentDeps, str],
-    store: InMemorySessionStore,
-    settings,
-    stt: FakeSTT,
-    tts_factory: FakeTTSFactory,
-    thread_id: str = "voice-thread",
-) -> tuple[VoiceSession, FakeWebSocket]:
-    websocket = FakeWebSocket()
-    session = VoiceSession(
-        websocket=websocket,
-        agent=agent,
-        store=store,
-        settings=settings,
-        thread_id=thread_id,
+class _FakeWebSocket:
+    """The transport only reads headers during construction."""
+
+    headers: dict[str, str] = {}
+
+
+def _openrouter_config(test_settings, *, provider: str = "openrouter"):
+    return test_settings.model_copy(
+        update={
+            "llm": test_settings.llm.model_copy(update={"provider": provider}),
+            "openrouter": OpenRouterSettings(
+                _env_file=None,
+                api_key="openrouter-key",
+                model="recursive/flint-v1.0:free",
+                url=OPENROUTER_BASE_URL,
+            ),
+        }
+    )
+
+
+def _sample_config(assemblyai: AssemblyAISettings):
+    from app.core.config import Settings
+
+    return Settings(assemblyai=assemblyai, _env_file=None)
+
+
+def test_assemblyai_settings_omit_unset_turn_detection():
+    settings = _assemblyai_settings(
+        _sample_config(
+            AssemblyAISettings(_env_file=None, api_key="key")
+        )
+    )
+
+    assert settings.model == "universal-3-6-pro"
+    assert isinstance(settings.min_turn_silence, NotGiven)
+    assert isinstance(settings.max_turn_silence, NotGiven)
+
+
+def test_assemblyai_settings_map_turn_detection():
+    settings = _assemblyai_settings(
+        _sample_config(
+            AssemblyAISettings(
+                _env_file=None,
+                api_key="key",
+                min_turn_silence=350,
+                max_turn_silence=2000,
+            )
+        )
+    )
+
+    assert settings.min_turn_silence == 350
+    assert settings.max_turn_silence == 2000
+
+
+def test_build_stt_requires_an_api_key(test_settings):
+    config = test_settings.model_copy(
+        update={"assemblyai": AssemblyAISettings(_env_file=None)}
+    )
+
+    with pytest.raises(ValueError, match="ASSEMBLYAI_API_KEY"):
+        build_stt(config)
+
+
+def test_build_tts_requires_credentials(test_settings):
+    from app.core.config import ElevenLabsSettings
+
+    config = test_settings.model_copy(
+        update={"elevenlabs": ElevenLabsSettings(_env_file=None)}
+    )
+
+    with pytest.raises(ValueError, match="ELEVENLABS"):
+        build_tts(config)
+
+
+def test_build_stt_and_tts_use_the_configured_rates(test_settings):
+    stt = build_stt(test_settings)
+    tts = build_tts(test_settings)
+
+    assert stt._settings.model == "universal-3-6-pro"
+    # ElevenLabs resolves the wire format when the session starts; the
+    # configured rate is what the transport must announce.
+    assert tts._init_sample_rate == test_settings.elevenlabs.sample_rate
+
+
+def test_transport_announces_the_rates_the_client_uses(test_settings):
+    transport = build_transport(_FakeWebSocket(), test_settings)  # type: ignore[arg-type]
+
+    assert transport._params.audio_in_sample_rate == 16_000
+    assert transport._params.audio_out_sample_rate == 24_000
+    assert transport._params.audio_in_enabled
+    assert transport._params.audio_out_enabled
+
+
+def test_context_starts_with_the_prompt_and_prior_turns():
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart
+
+    context = build_context(
+        [
+            ModelRequest.user_text_prompt("Hello"),
+            ModelResponse(parts=[TextPart("Hi there")]),
+        ],
+    )
+
+    messages = context.get_messages()
+    assert messages[0] == {
+        "role": "system",
+        "content": load_instructions(),
+    }
+    assert {"role": "user", "content": "Hello"} in messages
+    assert {"role": "assistant", "content": "Hi there"} in messages
+    assert context.tools
+
+
+def test_pipeline_wires_every_processor(test_settings):
+    transport = build_transport(_FakeWebSocket(), test_settings)  # type: ignore[arg-type]
+    context = build_context([])
+    stt = build_stt(test_settings)
+    llm = build_local_llm(test_settings)
+    tts = build_tts(test_settings)
+
+    pipeline, aggregators = build_pipeline(
+        transport=transport,
         stt=stt,
-        tts_factory=tts_factory,
-    )
-    return session, websocket
-
-
-async def test_text_turn_streams_ag_ui_and_audio(
-    agent, store, test_settings, wait_until
-):
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory(chunks=(b"\x10\x20", b"\x30\x40"))
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
+        llm=llm,
+        tts=tts,
+        context=context,
+        config=test_settings,
     )
 
-    task = asyncio.create_task(session.run())
-    await websocket.feed(json.dumps({"type": "text", "text": "Hi coach"}))
-    await wait_until(lambda: websocket.contains_text("RUN_FINISHED"))
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
+    assert isinstance(pipeline, Pipeline)
+    assert isinstance(aggregators, LLMContextAggregatorPair)
 
-    texts = websocket.texts
-    assert any('"TEXT_MESSAGE_CONTENT"' in text for text in texts)
-    assert websocket.contains_text("How was your day?")
-    assert any('"voice.audio.start"' in text for text in texts)
-    assert any('"voice.audio.end"' in text for text in texts)
-
-    assert websocket.binaries == [b"\x10\x20", b"\x30\x40"]
-
-    tts = tts_factory.last
-    assert tts.started and tts.finished and tts.closed
-    # Text is streamed to the TTS engine before the turn finishes.
-    assert "".join(tts.texts).startswith("Hello there!")
-
-    history = await store.get_history("voice-thread")
-    assert history, "voice turns must be persisted to the session store"
-
-
-async def test_audio_start_announces_the_format_the_client_must_use(
-    agent, store, test_settings, wait_until
-):
-    """The browser declares its AudioBuffer from this payload; if it drifts,
-    playback speed drifts with it."""
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory()
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    await websocket.feed(json.dumps({"type": "text", "text": "Hi"}))
-    await wait_until(lambda: websocket.contains_text("RUN_FINISHED"))
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-    events = [json.loads(text) for text in websocket.texts if text.startswith("{")]
-    start = next(e for e in events if e.get("name") == "voice.audio.start")
-    assert start["value"]["sampleRate"] == 24_000
-    assert start["value"]["channels"] == 1
-    assert start["value"]["format"] == "pcm_s16le"
-
-
-async def test_client_audio_is_forwarded_to_stt(
-    agent, store, test_settings, wait_until
-):
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory()
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    await websocket.feed(json.dumps({"type": "session.start", "sampleRate": 16000}))
-    await websocket.feed(b"\x00\x01" * 16)
-    await wait_until(lambda: stt.started and bool(stt.chunks))
-
-    # A final transcription turn triggers a full agent + TTS response.
-    stt.push(make_turn("Please correct my sentence", final=True, order=1))
-    await wait_until(lambda: websocket.contains_text("RUN_FINISHED"))
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-    assert stt.chunks == [b"\x00\x01" * 16]
-    assert websocket.contains_text('"voice.transcript"')
-
-
-async def test_partial_transcript_does_not_start_a_turn(
-    agent, store, test_settings, wait_until
-):
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory()
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("Please correct", final=False))
-    await wait_until(lambda: websocket.contains_text('"voice.transcript"'))
-    await asyncio.sleep(0.05)
-
-    assert not websocket.contains_text("RUN_STARTED")
-    assert tts_factory.created == []
-
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-
-async def test_barge_in_interrupts_the_assistant(
-    store, test_settings, wait_until
-):
-    gate = asyncio.Event()
-
-    async def slow_stream(
-        messages: list[ModelMessage], info: AgentInfo
-    ) -> AsyncIterator[str]:
-        yield "Let me think about "
-        await gate.wait()
-        yield "that for a moment."
-
-    agent = build_coach_agent(FunctionModel(stream_function=slow_stream))
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory(chunks=(b"\x01\x02",))
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("Tell me about London", final=True))
-    await wait_until(lambda: websocket.contains_text("TEXT_MESSAGE_CONTENT"))
-
-    stt.push(SttSpeechStarted(timestamp_ms=1))
-    await wait_until(lambda: websocket.contains_text('"voice.interrupted"'))
-
-    assert tts_factory.last.closed, "the TTS context must be torn down on barge-in"
-
-    gate.set()
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-
-async def test_pause_split_fragments_are_answered_as_one_utterance(
-    agent, store, test_settings, wait_until
-):
-    """A sentence spoken with "medias" arrives as several finals.
-
-    Regression: each fragment used to trigger its own turn, cancelling the
-    previous one, so the coach only ever answered the last fragment and the
-    earlier text never reached the history.
-    """
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory()
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("I went to the", final=True, order=1))
-    stt.push(make_turn("market yesterday", final=True, order=2))
-    stt.push(make_turn("and bought some fruit", final=True, order=3))
-
-    await wait_until(lambda: websocket.contains_text("RUN_FINISHED"))
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-    runs = [e for e in websocket.events() if '"RUN_STARTED"' in e]
-    assert len(runs) == 1, "one pause-free reply per utterance, not one per fragment"
-    assert len(tts_factory.created) == 1
-
-    history = await store.get_history("voice-thread")
-    joined = " ".join(
-        part.content
-        for message in history
-        for part in getattr(message, "parts", ())
-        if hasattr(part, "content")
-    )
-    assert "I went to the market yesterday" in joined
-    assert "and bought some fruit" in joined, "the whole utterance must reach the LLM"
-
-
-async def test_separate_utterances_get_separate_replies(
-    agent, store, test_settings, wait_until
-):
-    """Once the grace period elapses, the next fragment is a new turn."""
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory()
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("First question", final=True, order=1))
-    await wait_until(lambda: len(tts_factory.created) == 1)
-    await wait_until(lambda: websocket.contains_text("RUN_FINISHED"))
-    # A real pause: longer than `turn_grace_ms` (30 ms in the test settings).
-    await asyncio.sleep(0.2)
-    stt.push(make_turn("Second question", final=True, order=2))
-    await wait_until(lambda: len(tts_factory.created) == 2)
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-    assert len(tts_factory.created) == 2, "a real pause must start a new turn"
-
-
-async def test_transcript_accumulates_until_the_reply(
-    agent, store, test_settings, wait_until
-):
-    """The client must be able to keep the whole sentence on screen."""
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory()
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("I was thinking", final=True, order=1))
-    stt.push(make_turn("about the past", final=True, order=2))
-    await wait_until(lambda: websocket.contains_text('"utterance"'))
-
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-    transcripts = [
-        e["value"]
-        for e in (json.loads(text) for text in websocket.events())
-        if e.get("name") == "voice.transcript"
+    processors = pipeline.processors
+    # Pipeline adds a Source and a Sink around the seven configured stages.
+    assert len(processors) == 9
+    middle = processors[1:-1]
+    assert [type(processor) for processor in middle] == [
+        type(transport.input()),
+        type(stt),
+        type(aggregators.user()),
+        type(llm),
+        type(tts),
+        type(transport.output()),
+        type(aggregators.assistant()),
     ]
-    assert transcripts[-1]["text"] == "about the past"
-    assert transcripts[-1]["utterance"] == "I was thinking about the past"
 
 
-async def test_fragment_arriving_during_the_reply_is_merged_not_dropped(
-    agent, store, test_settings, wait_until
+async def test_worker_installs_the_rtvi_processor(test_settings):
+    transport = build_transport(_FakeWebSocket(), test_settings)  # type: ignore[arg-type]
+    pipeline, _ = build_pipeline(
+        transport=transport,
+        stt=build_stt(test_settings),
+        llm=build_local_llm(test_settings),
+        tts=build_tts(test_settings),
+        context=build_context([]),
+        config=test_settings,
+    )
+
+    rtvi = RTVIProcessor()
+    worker = PipelineWorker(
+        pipeline,
+        params=PipelineParams(
+            audio_in_sample_rate=test_settings.voice.input_sample_rate,
+            audio_out_sample_rate=test_settings.elevenlabs.sample_rate,
+            enable_metrics=True,
+        ),
+        rtvi_processor=rtvi,
+    )
+
+    assert worker.rtvi is rtvi
+
+
+async def test_voice_llm_local_mode(test_settings):
+    config = test_settings.model_copy(
+        update={"llm": test_settings.llm.model_copy(update={"provider": "local"})}
+    )
+
+    assert isinstance(await build_voice_llm(config), OpenAILLMService)
+
+
+async def test_voice_llm_openrouter_mode(test_settings):
+    llm = await build_voice_llm(_openrouter_config(test_settings))
+
+    assert isinstance(llm, OpenRouterLLMService)
+
+
+async def test_voice_llm_openrouter_needs_credentials(test_settings):
+    config = test_settings.model_copy(
+        update={"llm": test_settings.llm.model_copy(update={"provider": "openrouter"})}
+    )
+
+    with pytest.raises(ValueError, match="OpenRouter is not configured"):
+        await build_voice_llm(config)
+
+
+def _patch_probe_client(monkeypatch, handler):
+    """Replace ``httpx.AsyncClient`` so the probe never touches the network."""
+
+    class _Client:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def post(self, url, *, json=None, headers=None):
+            return handler(url, json, headers)
+
+    monkeypatch.setattr("app.services.voice.llm.httpx.AsyncClient", _Client)
+
+
+async def test_probe_accepts_a_local_completion(test_settings, monkeypatch):
+    _patch_probe_client(
+        monkeypatch,
+        lambda *_: httpx.Response(
+            200, json={"choices": [{"message": {"content": "p"}}]}
+        ),
+    )
+
+    usable, reason = await local_model_usable(test_settings)
+
+    assert usable is True
+    assert reason == "ok"
+
+
+async def test_probe_reports_lm_studio_without_a_model(test_settings, monkeypatch):
+    _patch_probe_client(
+        monkeypatch,
+        lambda *_: httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": (
+                        "No models loaded. Please load a model in the "
+                        "developer page or use the 'lms load' command."
+                    )
+                }
+            },
+        ),
+    )
+
+    usable, reason = await local_model_usable(test_settings)
+
+    assert usable is False
+    assert "No models loaded" in reason
+
+
+async def test_probe_rejects_an_empty_completion(test_settings, monkeypatch):
+    _patch_probe_client(
+        monkeypatch, lambda *_: httpx.Response(200, json={"choices": []})
+    )
+
+    usable, reason = await local_model_usable(test_settings)
+
+    assert usable is False
+    assert "empty completion" in reason
+
+
+async def test_probe_handles_a_dead_server(test_settings, monkeypatch):
+    def _boom(*_args, **_kwargs):
+        raise httpx.ConnectError("connection refused")
+
+    _patch_probe_client(monkeypatch, _boom)
+
+    usable, reason = await local_model_usable(test_settings)
+
+    assert usable is False
+    assert "ConnectError" in reason
+
+
+async def test_fallback_prefers_a_usable_local_model(test_settings, monkeypatch):
+    async def _usable(*_args, **_kwargs) -> tuple[bool, str]:
+        return True, "ok"
+
+    monkeypatch.setattr("app.services.voice.llm.local_model_usable", _usable)
+
+    llm = await build_voice_llm(_openrouter_config(test_settings, provider="fallback"))
+
+    assert isinstance(llm, OpenAILLMService)
+
+
+async def test_fallback_switches_to_openrouter_when_local_is_unusable(
+    test_settings, monkeypatch
 ):
-    """A pause right after the coach starts answering must still be understood.
+    async def _unusable(*_args, **_kwargs) -> tuple[bool, str]:
+        return False, "HTTP 400: No models loaded"
 
-    The old code cancelled the in-flight turn, losing the fragment entirely.
-    """
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory()
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
+    monkeypatch.setattr("app.services.voice.llm.local_model_usable", _unusable)
+
+    llm = await build_voice_llm(_openrouter_config(test_settings, provider="fallback"))
+
+    assert isinstance(llm, OpenRouterLLMService)
+
+
+async def test_fallback_degrades_to_local_without_openrouter(test_settings):
+    assert isinstance(await build_voice_llm(test_settings), OpenAILLMService)
+
+
+async def test_closed_local_port_is_unusable(test_settings):
+    config = test_settings.model_copy(
+        update={
+            "llm": test_settings.llm.model_copy(
+                update={
+                    "base_url": "http://127.0.0.1:1/v1",
+                    "probe_timeout": 0.2,
+                }
+            )
+        }
     )
 
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("Can you explain", final=True, order=1))
-    stt.push(make_turn("the past perfect", final=True, order=2))
+    usable, reason = await local_model_usable(config)
 
-    await wait_until(lambda: websocket.contains_text("RUN_FINISHED"))
-    await asyncio.sleep(0.2)
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-    assert len(tts_factory.created) == 1, "the fragments form a single utterance"
-
-
-async def test_barge_in_keeps_what_the_user_said(
-    store, test_settings, wait_until
-):
-    """The words spoken before an interruption must reach the history.
-
-    Regression: a cancelled turn skipped `set_history` entirely, so barge-in
-    silently erased both the user's sentence and the coach's partial reply.
-    With several interruptions in a row the model lost the thread of the
-    conversation completely.
-    """
-    gate = asyncio.Event()
-
-    async def slow_stream(
-        messages: list[ModelMessage], info: AgentInfo
-    ) -> AsyncIterator[str]:
-        yield "London is "
-        await gate.wait()
-        yield "the capital of England."
-
-    agent = build_coach_agent(FunctionModel(stream_function=slow_stream))
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory(chunks=(b"\x01\x02",))
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("Tell me about London", final=True))
-    await wait_until(lambda: websocket.contains_text("TEXT_MESSAGE_CONTENT"))
-
-    stt.push(SttSpeechStarted(timestamp_ms=1))
-    await wait_until(lambda: websocket.contains_text('"voice.interrupted"'))
-    await asyncio.sleep(0.05)
-
-    history = await store.get_history("voice-thread")
-    rendered = _render_history(history)
-    assert "Tell me about London" in rendered, (
-        "the user's sentence must survive a barge-in"
-    )
-    assert "London is " in rendered, (
-        "the interrupted reply must be recorded so the model knows it spoke"
-    )
-
-    gate.set()
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-
-async def test_next_turn_receives_the_interrupted_context(
-    store, test_settings, wait_until
-):
-    """The turn after a barge-in must be told what was already said."""
-    seen: list[str] = []
-    gate = asyncio.Event()
-
-    async def recording_stream(
-        messages: list[ModelMessage], info: AgentInfo
-    ) -> AsyncIterator[str]:
-        seen.append(_render_history(messages))
-        yield "First answer."
-        await gate.wait()
-
-    agent = build_coach_agent(FunctionModel(stream_function=recording_stream))
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory(chunks=(b"\x01\x02",))
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("My name is Ana", final=True, order=1))
-    await wait_until(lambda: websocket.contains_text("TEXT_MESSAGE_CONTENT"))
-
-    stt.push(SttSpeechStarted(timestamp_ms=1))
-    await wait_until(lambda: websocket.contains_text('"voice.interrupted"'))
-    await asyncio.sleep(0.05)
-
-    stt.push(make_turn("What is my name?", final=True, order=2))
-    await wait_until(lambda: len(seen) >= 2)
-
-    assert "My name is Ana" in seen[-1], (
-        "the second turn must see the sentence lost by the barge-in"
-    )
-    assert "First answer." in seen[-1], (
-        "the second turn must see the reply that was cut off"
-    )
-
-    gate.set()
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-
-async def test_interruption_before_any_token_records_only_the_user(
-    store, test_settings, wait_until
-):
-    """Nothing to save for the reply, and no half-empty assistant message."""
-    gate = asyncio.Event()
-
-    async def blocked_stream(
-        messages: list[ModelMessage], info: AgentInfo
-    ) -> AsyncIterator[str]:
-        await gate.wait()
-        yield "Too late."
-
-    agent = build_coach_agent(FunctionModel(stream_function=blocked_stream))
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory(chunks=(b"\x01\x02",))
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("Are you there?", final=True))
-    await wait_until(lambda: websocket.contains_text('"voice.listening"'))
-    await asyncio.sleep(0.05)
-
-    stt.push(SttSpeechStarted(timestamp_ms=1))
-    await wait_until(lambda: websocket.contains_text('"voice.interrupted"'))
-    await asyncio.sleep(0.05)
-
-    history = await store.get_history("voice-thread")
-    rendered = _render_history(history)
-    assert "Are you there?" in rendered
-    assert "Too late." not in rendered
-
-    gate.set()
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-
-async def test_barge_in_discards_the_pending_utterance(
-    store, test_settings, wait_until
-):
-    """Barge-in resets the buffer so the next sentence starts clean."""
-    gate = asyncio.Event()
-
-    async def slow_stream(
-        messages: list[ModelMessage], info: AgentInfo
-    ) -> AsyncIterator[str]:
-        yield "Let me think about "
-        await gate.wait()
-        yield "that."
-
-    agent = build_coach_agent(FunctionModel(stream_function=slow_stream))
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory(chunks=(b"\x01\x02",))
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    stt.push(make_turn("Tell me about London", final=True))
-    await wait_until(lambda: websocket.contains_text("TEXT_MESSAGE_CONTENT"))
-
-    # Speech while the assistant talks, then a fragment that must NOT be
-    # concatenated with the interrupted sentence.
-    stt.push(SttSpeechStarted(timestamp_ms=1))
-    await wait_until(lambda: websocket.contains_text('"voice.interrupted"'))
-    stt.push(make_turn("Actually never mind", final=True, order=2))
-
-    gate.set()
-    await wait_until(lambda: len(tts_factory.created) == 2)
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-    transcripts = [
-        e["value"]
-        for e in (json.loads(text) for text in websocket.events())
-        if e.get("name") == "voice.transcript"
-    ]
-    assert transcripts[-1]["utterance"] == "Actually never mind", (
-        "the interrupted sentence must not bleed into the next one"
-    )
-
-
-async def test_session_rejects_unknown_control_frames_without_crashing(
-    agent, store, test_settings, wait_until
-):
-    stt = FakeSTT()
-    tts_factory = FakeTTSFactory()
-    session, websocket = _build_session(
-        agent=agent,
-        store=store,
-        settings=test_settings,
-        stt=stt,
-        tts_factory=tts_factory,
-    )
-
-    task = asyncio.create_task(session.run())
-    await websocket.feed("not-json")
-    await websocket.feed(json.dumps({"type": "nonsense"}))
-    await websocket.feed(json.dumps({"type": "text", "text": "Hi"}))
-    await wait_until(lambda: websocket.contains_text("RUN_FINISHED"))
-    await websocket.disconnect()
-    await asyncio.wait_for(task, timeout=2)
-
-    assert websocket.contains_text("TEXT_MESSAGE_CONTENT")
+    assert usable is False
+    assert reason

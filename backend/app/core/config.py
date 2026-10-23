@@ -47,9 +47,6 @@ SUPPORTED_PCM_FORMATS = frozenset(
     }
 )
 
-# ElevenLabs closes the socket with a 1008 policy violation above this value.
-MAX_CHUNK_SCHEDULE_ITEM = 500
-
 
 class LLMSettings(BaseSettings):
     """OpenAI-compatible chat model (local server or cloud provider)."""
@@ -61,6 +58,9 @@ class LLMSettings(BaseSettings):
     api_key: SecretStr = SecretStr("local")
     temperature: float = 0.7
     request_timeout: float = 120.0
+    # The voice fallback probes the local model with a one-token completion.
+    # This also bounds a model that is still loading.
+    probe_timeout: float = 4.0
 
     # Which backend answers chat turns:
     #
@@ -111,20 +111,20 @@ class AssemblyAISettings(BaseSettings):
 
     api_key: SecretStr | None = None
     speech_model: str = "universal-3-6-pro"
-    sample_rate: int = 16_000
     encoding: str = "pcm_s16le"
     # ``None`` lets AssemblyAI pick its own defaults for turn detection.
     #
     # `min_turn_silence` is the silence before a *speculative* end-of-turn
-    # check. Too low and every thinking pause ends the user's turn, which the
-    # pipeline then answers piecemeal.
+    # check. With Pipecat's turn tracking it is also sent as the forced
+    # ``max_turn_silence`` (see ``vad_force_turn_endpoint`` in the pipeline),
+    # so AssemblyAI does not end turns behind the smart-turn analyzer's back.
     min_turn_silence: int | None = None
-    # Hard ceiling: the turn ends after this much silence no matter what.
+    # Hard ceiling used only outside Pipecat's turn tracking mode. Kept so the
+    # value is available if turn detection is switched back to AssemblyAI.
     max_turn_silence: int | None = None
     # Only applies to the ``universal-streaming-*`` models, not to
     # ``universal-3-*``. Harmless elsewhere, but it has no effect there.
     end_of_turn_confidence_threshold: float | None = None
-    terminator_timeout: float = 30.0
 
     @property
     def is_configured(self) -> bool:
@@ -151,12 +151,6 @@ class ElevenLabsSettings(BaseSettings):
     model_id: str = "eleven_flash_v2_5"
     output_format: str = "pcm_24000"
     base_url: str = "wss://api.elevenlabs.io"
-    # ElevenLabs buffers text until it reaches one of these lengths. Lower
-    # values trade audio quality for time-to-first-byte.
-    chunk_schedule: Annotated[list[int], NoDecode] = Field(
-        default_factory=lambda: [50, 120, 200, 300]
-    )
-    request_timeout: float = 30.0
 
     @property
     def is_configured(self) -> bool:
@@ -165,28 +159,6 @@ class ElevenLabsSettings(BaseSettings):
             and bool(self.api_key.get_secret_value())
             and bool(self.voice_id)
         )
-
-    @field_validator("chunk_schedule", mode="before")
-    @classmethod
-    def _split_schedule(cls, value: object) -> object:
-        if isinstance(value, str):
-            return [int(part) for part in value.split(",") if part.strip()]
-        return value
-
-    @field_validator("chunk_schedule")
-    @classmethod
-    def _validate_schedule(cls, value: list[int]) -> list[int]:
-        if not value:
-            raise ValueError("ELEVENLABS_CHUNK_SCHEDULE must not be empty")
-        if any(
-            item < 1 or item > MAX_CHUNK_SCHEDULE_ITEM for item in value
-        ):
-            raise ValueError(
-                "ELEVENLABS_CHUNK_SCHEDULE items must be between 1 and "
-                f"{MAX_CHUNK_SCHEDULE_ITEM}; ElevenLabs closes the socket with "
-                "a 1008 policy violation above that"
-            )
-        return value
 
     @field_validator("output_format")
     @classmethod
@@ -218,17 +190,10 @@ class VoiceSettings(BaseSettings):
 
     # Hard cap so a forgotten WebSocket cannot bill AssemblyAI forever.
     max_session_seconds: int = 900
-    # Expected rate of the client's microphone chunks (AudioWorklet PCM16).
+    # Expected rate of the client's microphone chunks (AudioWorklet PCM16) and
+    # of the frames sent to AssemblyAI. The output rate is derived from
+    # ``ELEVENLABS_OUTPUT_FORMAT``.
     input_sample_rate: int = 16_000
-    # Rate announced to the client for TTS playback.
-    output_sample_rate: int = 24_000
-    # Interrupt playback when a new user turn starts while the assistant talks.
-    barge_in: bool = True
-    # How long the pipeline keeps collecting transcript fragments before it
-    # answers. AssemblyAI ends a turn at the first pause, so a sentence spoken
-    # with "medias" arrives as several fragments; without this grace period
-    # each fragment would cancel the previous reply and get answered alone.
-    turn_grace_ms: int = Field(default=500, ge=0, le=3_000)
 
 
 class SessionSettings(BaseSettings):

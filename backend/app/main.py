@@ -15,7 +15,6 @@ from app.agents.model import build_model
 from app.api.routes import chat, health, voice
 from app.core.config import Settings, settings as default_settings
 from app.core.logging import configure_logging, get_logger
-from app.services.voice.factory import build_stt, build_tts
 from app.sessions.store import InMemorySessionStore
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -32,8 +31,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ttl_seconds=config.session.ttl_seconds,
         max_messages=config.session.max_turns * 2,
     )
-    app.state.stt_factory = build_stt
-    app.state.tts_factory = build_tts
 
     logger.info(
         "LLM ready (provider=%s, local=%s @ %s, openrouter=%s)",
@@ -41,6 +38,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config.llm.base_model,
         config.llm.base_url,
         config.openrouter.model if config.openrouter.is_configured else "not configured",
+    )
+    logger.info(
+        "Voice pipeline ready (pipecat, in=%s Hz, out=%s Hz)",
+        config.voice.input_sample_rate,
+        config.elevenlabs.sample_rate,
     )
     if not config.assemblyai.is_configured:
         logger.warning(
@@ -68,7 +70,7 @@ def create_app(config: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="english-coach backend",
         version="0.1.0",
-        description="Streaming chat (AG-UI) and voice (AssemblyAI STT + ElevenLabs TTS).",
+        description="Streaming chat (AG-UI) and voice (Pipecat + AssemblyAI + ElevenLabs).",
         lifespan=lifespan,
     )
     app.state.settings = resolved

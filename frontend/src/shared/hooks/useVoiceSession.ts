@@ -1,6 +1,8 @@
-import { useState, useRef, useCallback } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
-import { createWebSocket } from '@/shared/lib/api'
+import { PipecatClient, TransportState } from '@pipecat-ai/client-js'
+import { WebSocketTransport } from '@pipecat-ai/websocket-transport'
+import { env } from '@/core/config/env'
 import { VoiceSessionState } from '@/shared/types'
 
 export interface IVoiceSession {
@@ -21,6 +23,15 @@ export interface IVoiceSession {
   switchToChat: () => void
 }
 
+/** Sample rates the backend pipeline is configured with. */
+const INPUT_SAMPLE_RATE = 16_000
+const OUTPUT_SAMPLE_RATE = 24_000
+
+function voiceUrl(threadId: string): string {
+  const base = env.API_URL.replace(/^http/, 'ws')
+  return `${base}/api/v1/voice/${threadId}`
+}
+
 export function useVoiceSession(): IVoiceSession {
   const navigate = useNavigate()
   const [state, setState] = useState<VoiceSessionState>('idle')
@@ -32,216 +43,123 @@ export function useVoiceSession(): IVoiceSession {
   const [statusChips, setStatusChips] = useState<string[]>([])
   const [micPermission, setMicPermission] = useState<'granted' | 'denied' | 'prompt'>('prompt')
   const [connectionQuality, setConnectionQuality] = useState<'good' | 'weak' | 'reconnecting'>('good')
-  
-  const wsRef = useRef<WebSocket | null>(null)
-  const threadId = useRef(`thread-${Date.now()}`)
-  const audioContextRef = useRef<AudioContext | null>(null)
-  const processorRef = useRef<ScriptProcessorNode | null>(null)
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
-  const streamRef = useRef<MediaStream | null>(null)
-  const isMutedRef = useRef(false)
-  const isPausedRef = useRef(false)
 
-  const floatTo16BitPCM = (input: Float32Array): ArrayBuffer => {
-    const buffer = new ArrayBuffer(input.length * 2)
-    const view = new DataView(buffer)
-    for (let i = 0; i < input.length; i++) {
-      let s = Math.max(-1, Math.min(1, input[i]))
-      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true)
-    }
-    return buffer
-  }
+  const clientRef = useRef<PipecatClient | null>(null)
+  const threadIdRef = useRef(`thread-${Date.now()}`)
+  const mutedRef = useRef(false)
+  const pausedRef = useRef(false)
 
-  const start = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: { 
-          sampleRate: 16000, 
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-        } 
-      })
-      streamRef.current = stream
-      setMicPermission('granted')
-      
-      audioContextRef.current = new AudioContext({ sampleRate: 16000 })
-      const analyser = audioContextRef.current.createAnalyser()
-      sourceRef.current = audioContextRef.current.createMediaStreamSource(stream)
-      sourceRef.current.connect(analyser)
-      analyser.fftSize = 256
-      
-      const dataArray = new Uint8Array(analyser.frequencyBinCount)
-      const updateVolume = () => {
-        if (analyser && !isPausedRef.current) {
-          analyser.getByteFrequencyData(dataArray)
-          const average = dataArray.reduce((a, b) => a + b) / dataArray.length
-          setVolume(average / 255)
-        }
-        requestAnimationFrame(updateVolume)
-      }
-      updateVolume()
-      
-      const ws = createWebSocket(`/api/v1/voice/${threadId.current}`)
-      wsRef.current = ws
-      ws.binaryType = 'arraybuffer'
-      
-      ws.onopen = () => {
-        console.log('WS connected')
-        setState('listening')
-        setStatusChips(['Escuchando...'])
-        setConnectionQuality('good')
-        setUserTranscript('')
-        setAssistantTranscript('')
-        
-        ws.send(JSON.stringify({ type: 'session.start', sampleRate: 16000 }))
-        
-        const source = sourceRef.current!
-        const processor = audioContextRef.current!.createScriptProcessor(4096, 1, 1)
-        processorRef.current = processor
-        
-        processor.onaudioprocess = (e) => {
-          if (ws.readyState === WebSocket.OPEN && !isMutedRef.current && !isPausedRef.current) {
-            const inputData = e.inputBuffer.getChannelData(0)
-            const pcmData = floatTo16BitPCM(inputData)
-            ws.send(pcmData)
-          }
-        }
-        
-        source.connect(processor)
-        processor.connect(audioContextRef.current!.destination)
-      }
-      
-      let currentAudioContext: AudioContext | null = null
-      let audioQueue: ArrayBuffer[] = []
-      let isPlaying = false
+  const makeClient = useCallback(() => {
+    const transport = new WebSocketTransport({
+      wsUrl: voiceUrl(threadIdRef.current),
+      recorderSampleRate: INPUT_SAMPLE_RATE,
+      playerSampleRate: OUTPUT_SAMPLE_RATE,
+    })
 
-      const playNextAudio = async () => {
-        if (isPlaying || audioQueue.length === 0) return
-        isPlaying = true
-        const buffer = audioQueue.shift()!
-        try {
-          if (!currentAudioContext || currentAudioContext.state === 'closed') {
-            currentAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 })
+    return new PipecatClient({
+      transport,
+      enableMic: true,
+      callbacks: {
+        onTransportStateChanged: (transportState: TransportState) => {
+          if (transportState === 'error' || transportState === 'disconnected') {
+            setConnectionQuality(transportState === 'error' ? 'weak' : 'good')
+          } else if (
+            transportState === 'connecting' ||
+            transportState === 'authenticating' ||
+            transportState === 'initializing'
+          ) {
+            setConnectionQuality('reconnecting')
+          } else if (transportState === 'ready' || transportState === 'connected') {
+            setConnectionQuality('good')
           }
-          if (currentAudioContext.state === 'suspended') {
-            await currentAudioContext.resume()
+        },
+        onBotReady: () => {
+          setMicPermission('granted')
+          setConnectionQuality('good')
+          setState('listening')
+          setStatusChips(['Escuchando...'])
+          // Apply a mute/pause chosen before the session finished connecting.
+          clientRef.current?.enableMic(
+            !mutedRef.current && !pausedRef.current,
+          )
+        },
+        onUserStartedSpeaking: () => {
+          setState('listening')
+          setStatusChips(['Escuchando...'])
+        },
+        onUserStoppedSpeaking: () => {
+          setState('processing')
+          setStatusChips(['Procesando...'])
+        },
+        onUserTranscript: (data) => {
+          if (data?.text) setUserTranscript(data.text)
+        },
+        onBotLlmStarted: () => {
+          setAssistantTranscript('')
+        },
+        onBotLlmText: (data) => {
+          if (data?.text) {
+            setAssistantTranscript((previous) => previous + data.text)
           }
-          const audioBuffer = await currentAudioContext.decodeAudioData(buffer.slice(0))
-          const source = currentAudioContext.createBufferSource()
-          source.buffer = audioBuffer
-          source.connect(currentAudioContext.destination)
-          source.onended = () => {
-            isPlaying = false
-            playNextAudio()
-          }
-          source.start()
-        } catch (e) {
-          console.error('Error playing audio:', e)
-          isPlaying = false
-          playNextAudio()
-        }
-      }
-
-      ws.onmessage = (event) => {
-        if (typeof event.data === 'string') {
-          try {
-            const data = JSON.parse(event.data)
-            console.log('WS:', data.type, data.name)
-            if (data.type === 'CUSTOM') {
-              if (data.name === 'voice.session_end' || data.name === 'voice_session_end') {
-                setState('idle')
-                setStatusChips([])
-              } else if (data.name === 'voice.transcript') {
-                if (data.value?.text) {
-                  setUserTranscript(data.value.utterance || data.value.text)
-                }
-              } else if (data.name === 'voice.listening') {
-                if (data.value?.active) {
-                  setState('listening')
-                  setStatusChips(['Escuchando...'])
-                } else {
-                  setState('processing')
-                  setStatusChips(['Procesando...'])
-                }
-              } else if (data.name === 'voice.interrupted') {
-                setState('interrupted')
-                setStatusChips(['Interrumpido'])
-              } else if (data.name === 'voice.audio_start') {
-                setState('speaking')
-                setStatusChips(['Hablando...'])
-                setAssistantTranscript('')
-                audioQueue = []
-                isPlaying = false
-              } else if (data.name === 'voice.audio_end') {
-                setState('listening')
-                setStatusChips(['Escuchando...'])
-              }
-            } else if (data.type === 'RUN_STARTED') {
-              setState('processing')
-              setStatusChips(['Procesando...'])
-            } else if (data.type === 'TEXT_MESSAGE_START') {
-              setState('speaking')
-              setStatusChips(['Hablando...'])
-              setAssistantTranscript('')
-            } else if (data.type === 'TEXT_MESSAGE_CONTENT') {
-              setAssistantTranscript((prev) => prev + (data.delta || ''))
-            } else if (data.type === 'TEXT_MESSAGE_END') {
-              // Keep speaking until audio ends
-            } else if (data.type === 'RUN_ERROR') {
-              console.error('Run error:', data.message)
-              setState('listening')
-              setStatusChips(['Error'])
-            }
-          } catch (e) {
-            console.error('Error parsing:', e)
-          }
-        } else if (event.data instanceof ArrayBuffer) {
-          audioQueue.push(event.data)
-          playNextAudio()
-        }
-      }
-      
-      ws.onerror = (e) => {
-        console.error('WS error:', e)
-        setConnectionQuality('weak')
-      }
-      
-      ws.onclose = (e) => {
-        console.log('WS closed:', e.code)
-        setState('idle')
-        setStatusChips([])
-      }
-    } catch (error) {
-      console.error('Error starting:', error)
-      setMicPermission('denied')
-    }
+        },
+        onBotStartedSpeaking: () => {
+          setState('speaking')
+          setStatusChips(['Hablando...'])
+        },
+        onBotStoppedSpeaking: () => {
+          setState('listening')
+          setStatusChips(['Escuchando...'])
+        },
+        onLocalAudioLevel: (level) => {
+          // The transport reports 0..1; smooth it a little for the orb.
+          setVolume((previous) => Math.max(0, Math.min(1, previous * 0.6 + level * 0.4)))
+        },
+        onDeviceError: () => {
+          setMicPermission('denied')
+        },
+        onError: (message) => {
+          console.error('Voice session error:', message)
+          setConnectionQuality('weak')
+          setStatusChips(['Error de conexión'])
+        },
+      },
+    })
   }, [])
 
-  const stop = useCallback(() => {
-    if (processorRef.current) {
-      processorRef.current.disconnect()
-      processorRef.current = null
-    }
-    if (sourceRef.current) {
-      sourceRef.current.disconnect()
-      sourceRef.current = null
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop())
-      streamRef.current = null
-    }
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      audioContextRef.current.close()
-      audioContextRef.current = null
-    }
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+  const start = useCallback(async () => {
+    if (clientRef.current) return
+
+    const client = makeClient()
+    clientRef.current = client
+    setUserTranscript('')
+    setAssistantTranscript('')
+    setStatusChips(['Conectando...'])
+
+    try {
+      await client.connect()
+    } catch (error) {
+      console.error('Error starting voice session:', error)
+      setMicPermission('denied')
+      setConnectionQuality('weak')
+      setStatusChips(['No se pudo conectar'])
+      setState('idle')
+      clientRef.current = null
       try {
-        wsRef.current.send(JSON.stringify({ type: 'session.stop' }))
-      } catch {}
-      wsRef.current.close()
+        await client.disconnect()
+      } catch {
+        // Already disconnected.
+      }
     }
-    wsRef.current = null
+  }, [makeClient])
+
+  const stop = useCallback(() => {
+    const client = clientRef.current
+    clientRef.current = null
+    if (client) {
+      client.disconnect().catch((error) => {
+        console.error('Error closing voice session:', error)
+      })
+    }
     setState('idle')
     setStatusChips([])
     setUserTranscript('')
@@ -250,23 +168,26 @@ export function useVoiceSession(): IVoiceSession {
   }, [])
 
   const toggleMute = useCallback(() => {
-    setIsMuted((prev) => {
-      isMutedRef.current = !prev
-      return !prev
+    setIsMuted((previous) => {
+      const next = !previous
+      mutedRef.current = next
+      clientRef.current?.enableMic(!next && !pausedRef.current)
+      return next
     })
   }, [])
 
   const togglePause = useCallback(() => {
-    setIsPaused((prev) => {
-      isPausedRef.current = !prev
-      return !prev
+    setIsPaused((previous) => {
+      const next = !previous
+      pausedRef.current = next
+      clientRef.current?.enableMic(!next && !mutedRef.current)
+      return next
     })
   }, [])
 
   const interrupt = useCallback(() => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'interrupt' }))
-    }
+    // Barge-in by voice is handled by the server's VAD; this is the button.
+    clientRef.current?.sendClientMessage('interrupt')
     setState('interrupted')
     setStatusChips(['Interrumpido'])
   }, [])
@@ -275,6 +196,18 @@ export function useVoiceSession(): IVoiceSession {
     stop()
     navigate({ to: '/chat' })
   }, [navigate, stop])
+
+  useEffect(() => {
+    return () => {
+      const client = clientRef.current
+      clientRef.current = null
+      if (client) {
+        client.disconnect().catch(() => {
+          // Nothing to clean up if the socket is already gone.
+        })
+      }
+    }
+  }, [])
 
   return {
     state,

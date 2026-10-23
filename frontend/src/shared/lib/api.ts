@@ -17,8 +17,3 @@ export async function fetchAPI<T>(endpoint: string, options?: RequestInit): Prom
 
   return response.json()
 }
-
-export function createWebSocket(path: string): WebSocket {
-  const wsUrl = API_BASE.replace('http', 'ws')
-  return new WebSocket(`${wsUrl}${path}`)
-}

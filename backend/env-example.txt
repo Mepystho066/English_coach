@@ -5,10 +5,15 @@
 
 # --- LLM (OpenAI-compatible; e.g. LM Studio / Ollama / vLLM) ----------------
 LLM_BASE_URL=http://127.0.0.1:1234/v1
+# Must match the id returned by GET {LLM_BASE_URL}/models, not a placeholder.
 LLM_BASE_MODEL=localmodel
 # Some local servers require any non-empty key; cloud providers require the real one.
 LLM_API_KEY=local
 LLM_TEMPERATURE=0.7
+# Voice sends a one-token completion at session start. If the local model cannot
+# answer (server down, no model loaded, wrong model id), `fallback` switches to
+# OpenRouter for that session.
+LLM_PROBE_TIMEOUT=4.0
 # Which backend answers: fallback (local, then OpenRouter) | local | openrouter
 LLM_PROVIDER=fallback
 
@@ -26,14 +31,15 @@ OPEN_ROUTER_APP_URL=
 # --- AssemblyAI (streaming STT) --------------------------------------------
 ASSEMBLYAI_API_KEY=
 ASSEMBLYAI_SPEECH_MODEL=universal-3-6-pro
-ASSEMBLYAI_SAMPLE_RATE=16000
 ASSEMBLYAI_ENCODING=pcm_s16le
-# Turn detection tuning (milliseconds / confidence 0..1).
-# `MIN_TURN_SILENCE` is the silence before a *speculative* end-of-turn check.
-# Too low (the old 120) and every thinking pause ends the user's turn, so a
-# sentence with "medias" is answered one fragment at a time. 300-400 is a good
-# value. `MAX_TURN_SILENCE` force-ends the turn regardless of punctuation.
+# Turn detection is owned by Pipecat (Silero VAD + Local Smart Turn v3). With
+# `vad_force_turn_endpoint=True` the pipeline also sends MIN_TURN_SILENCE as the
+# forced MAX_TURN_SILENCE, so AssemblyAI does not end turns on its own. This lets
+# a sentence with "medias" stay open through a thinking pause instead of being
+# answered one fragment at a time.
 ASSEMBLYAI_MIN_TURN_SILENCE=350
+# Sent to AssemblyAI, but Pipecat overrides it to MIN_TURN_SILENCE while turn
+# detection is delegated to the VAD + smart-turn pipeline (the default).
 ASSEMBLYAI_MAX_TURN_SILENCE=2000
 # Only applies to the universal-streaming-* models, NOT to universal-3-*. It is
 # silently ignored (and useless) with the default model below.
@@ -45,20 +51,15 @@ ELEVENLABS_VOICE_ID=
 ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 # Must be raw PCM so the browser can play the frames without decoding.
 # One of: pcm_8000, pcm_16000, pcm_22050, pcm_24000, pcm_44100, pcm_48000
+# This also sets the output sample rate announced to the client.
 ELEVENLABS_OUTPUT_FORMAT=pcm_24000
-# Comma-separated, each item between 1 and 500; lower values = lower latency,
-# lower quality. ElevenLabs closes the socket (1008) above 500.
-ELEVENLABS_CHUNK_SCHEDULE=50,120,200,300
 ELEVENLABS_BASE_URL=wss://api.elevenlabs.io
 
-# --- Voice pipeline ---------------------------------------------------------
+# --- Voice pipeline (Pipecat) -----------------------------------------------
 VOICE_MAX_SESSION_SECONDS=900
+# Rate of the microphone PCM16 frames sent by the browser and forwarded to
+# AssemblyAI. The output rate comes from ELEVENLABS_OUTPUT_FORMAT.
 VOICE_INPUT_SAMPLE_RATE=16000
-VOICE_OUTPUT_SAMPLE_RATE=24000
-# Extra silence to wait before answering, so fragments split by a natural pause
-# are answered together instead of cancelling each other. Added on top of
-# ASSEMBLYAI_MIN_TURN_SILENCE.
-VOICE_TURN_GRACE_MS=500
 
 # --- Session store ----------------------------------------------------------
 SESSION_TTL_SECONDS=3600
