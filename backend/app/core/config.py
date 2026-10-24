@@ -148,7 +148,7 @@ class ElevenLabsSettings(BaseSettings):
 
     api_key: SecretStr | None = None
     voice_id: str | None = None
-    model_id: str = "eleven_flash_v2_5"
+    model_id: str = "eleven_v4_turbo"
     output_format: str = "pcm_24000"
     base_url: str = "wss://api.elevenlabs.io"
 

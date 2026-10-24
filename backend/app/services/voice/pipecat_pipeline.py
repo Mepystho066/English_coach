@@ -123,20 +123,24 @@ def build_stt(config: Settings) -> AssemblyAISTTService:
 
 
 def build_tts(config: Settings) -> ElevenLabsDialogueTTSService:
-    """Build the streaming ElevenLabs Dialogue service for v3/v4."""
+
     if not config.elevenlabs.is_configured:
-        raise ValueError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be set")
+        ValueError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be set")
     return ElevenLabsDialogueTTSService(
         api_key=config.elevenlabs.api_key.get_secret_value(),
         settings=ElevenLabsDialogueTTSService.Settings(
             voice=config.elevenlabs.voice_id,
-            model="eleven_v4_turbo",  # o "eleven_v4"
+            model=config.elevenlabs.model_id,   # ← hardcodeado
             stability=0.5,
         ),
     )
 
-def build_tts_v2(config: Settings) -> ElevenLabsTTSService:
-    """Build the streaming ElevenLabs service."""
+def build_tts_v1(config: Settings) -> ElevenLabsTTSService:
+    """Build the streaming ElevenLabs TTS service.
+
+    Respects ``ELEVENLABS_*`` settings: ``API_KEY``, ``VOICE_ID``, ``MODEL_ID``,
+    ``OUTPUT_FORMAT`` (drives sample rate) and ``BASE_URL``.
+    """
     if not config.elevenlabs.is_configured:
         raise ValueError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be set")
     return ElevenLabsTTSService(
@@ -148,7 +152,6 @@ def build_tts_v2(config: Settings) -> ElevenLabsTTSService:
             model=config.elevenlabs.model_id,
         ),
     )
-
 
 def build_context(history: list[ModelMessage]) -> LLMContext:
     """Build the LLM context seeded with instructions and prior turns."""

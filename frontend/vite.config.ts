@@ -4,12 +4,15 @@ import path from 'path'
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  server:{
-    allowedHosts: [
-      'jazmine-schoolgirlish-eda.ngrok-free.dev'
-    ]
-  },
   plugins: [react()],
+  server: {
+    host: true,
+    allowedHosts: [
+      'localhost',
+      '192.168.40.9',
+      'jazmine-schoolgirlish-eda.ngrok-free.dev',
+    ],
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

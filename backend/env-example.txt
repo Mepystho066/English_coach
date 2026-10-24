@@ -4,7 +4,7 @@
 # ---------------------------------------------------------------------------
 
 # --- LLM (OpenAI-compatible; e.g. LM Studio / Ollama / vLLM) ----------------
-LLM_BASE_URL=http://127.0.0.1:1234/v1
+LLM_BASE_URL=http://127.0.0.1:1234/api/v1
 # Must match the id returned by GET {LLM_BASE_URL}/models, not a placeholder.
 LLM_BASE_MODEL=localmodel
 # Some local servers require any non-empty key; cloud providers require the real one.
