@@ -64,6 +64,8 @@ VOICE_INPUT_SAMPLE_RATE=16000
 # --- Session store ----------------------------------------------------------
 SESSION_TTL_SECONDS=3600
 SESSION_MAX_TURNS=100
+# SQLite file for history that survives restarts (empty = in memory)
+SESSION_DB_PATH=data/sessions.db
 
 # --- HTTP -------------------------------------------------------------------
 APP_ENV=development

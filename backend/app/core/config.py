@@ -203,6 +203,9 @@ class SessionSettings(BaseSettings):
 
     ttl_seconds: int = 3600
     max_turns: int = 100
+    # SQLite file for persistent history (relative paths resolve from backend/).
+    # Empty keeps history in memory, where it expires after ``ttl_seconds``.
+    db_path: str = ""
 
 
 class AppSettings(BaseSettings):

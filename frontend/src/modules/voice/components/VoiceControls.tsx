@@ -10,7 +10,8 @@ interface VoiceControlsProps {
   onToggleMute: () => void
   onTogglePause: () => void
   onStop: () => void
-  onSwitchToChat: () => void
+  isChatOpen: boolean
+  onToggleChat: () => void
 }
 
 export function VoiceControls({
@@ -20,7 +21,8 @@ export function VoiceControls({
   onToggleMute,
   onTogglePause,
   onStop,
-  onSwitchToChat,
+  isChatOpen,
+  onToggleChat,
 }: VoiceControlsProps) {
   const isActive = state !== 'idle'
 
@@ -64,14 +66,14 @@ export function VoiceControls({
       )}
 
       <Button
-        variant="secondary"
-        onClick={onSwitchToChat}
+        variant={isChatOpen ? 'default' : 'secondary'}
+        onClick={onToggleChat}
         className="rounded-full h-12 px-6"
-        aria-label="Cambiar a chat"
+        aria-label={isChatOpen ? 'Cerrar chat' : 'Abrir chat'}
+        aria-pressed={isChatOpen}
       >
         <MessageSquare className="h-5 w-5 mr-2" />
-        <span className="hidden sm:inline">Cambiar a Chat</span>
-        <span className="sm:hidden">Chat</span>
+        <span>{isChatOpen ? 'Cerrar chat' : 'Chat'}</span>
       </Button>
     </div>
   )

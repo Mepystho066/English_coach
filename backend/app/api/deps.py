@@ -7,7 +7,7 @@ from pydantic_ai import Agent
 
 from app.agents.deps import AgentDeps
 from app.core.config import Settings
-from app.sessions.store import InMemorySessionStore
+from app.sessions.store import SessionStore
 
 
 def get_settings(request: Request) -> Settings:
@@ -18,5 +18,5 @@ def get_agent(request: Request) -> Agent[AgentDeps, str]:
     return request.app.state.agent
 
 
-def get_store(request: Request) -> InMemorySessionStore:
+def get_store(request: Request) -> SessionStore:
     return request.app.state.store

@@ -1,4 +1,10 @@
-import { createRouter, createRoute, createRootRoute, Outlet } from '@tanstack/react-router'
+import {
+  createRouter,
+  createRoute,
+  createRootRoute,
+  Navigate,
+  Outlet,
+} from '@tanstack/react-router'
 import { AppShell } from '../shell/AppShell'
 import { modules } from '@/core/modules/registry'
 
@@ -20,7 +26,11 @@ const routeTree = rootRoute.addChildren(
   )
 )
 
-export const router = createRouter({ routeTree })
+export const router = createRouter({
+  routeTree,
+  // Old links such as /chat or /history land on the voice screen.
+  defaultNotFoundComponent: () => <Navigate to="/" />,
+})
 
 declare module '@tanstack/react-router' {
   interface Register {

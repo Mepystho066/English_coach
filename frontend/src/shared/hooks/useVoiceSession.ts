@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from '@tanstack/react-router'
 import { PipecatClient, TransportState } from '@pipecat-ai/client-js'
 import { WebSocketTransport } from '@pipecat-ai/websocket-transport'
 import { env } from '@/core/config/env'
 import { VoiceSessionState } from '@/shared/types'
+import { getThreadId } from '@/shared/lib/thread'
+
+export interface LiveTurn {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+}
 
 export interface IVoiceSession {
   state: VoiceSessionState
@@ -12,6 +18,7 @@ export interface IVoiceSession {
   volume: number
   userTranscript: string
   assistantTranscript: string
+  liveTurns: LiveTurn[]
   statusChips: string[]
   micPermission: 'granted' | 'denied' | 'prompt'
   connectionQuality: 'good' | 'weak' | 'reconnecting'
@@ -20,7 +27,6 @@ export interface IVoiceSession {
   toggleMute: () => void
   togglePause: () => void
   interrupt: () => void
-  switchToChat: () => void
 }
 
 /** Sample rates the backend pipeline is configured with. */
@@ -28,30 +34,41 @@ const INPUT_SAMPLE_RATE = 16_000
 const OUTPUT_SAMPLE_RATE = 24_000
 
 function voiceUrl(threadId: string): string {
-  const base = env.API_URL.replace(/^http/, 'ws')
+  const base = env.API_URL
+    ? env.API_URL.replace(/^http/, 'ws')
+    : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
   return `${base}/api/v1/voice/${threadId}`
 }
 
+function isMicError(error: unknown): boolean {
+  const name = (error as { name?: string } | null)?.name
+  return (
+    name === 'NotAllowedError' ||
+    name === 'NotFoundError' ||
+    name === 'SecurityError' ||
+    !window.isSecureContext
+  )
+}
+
 export function useVoiceSession(): IVoiceSession {
-  const navigate = useNavigate()
   const [state, setState] = useState<VoiceSessionState>('idle')
   const [isMuted, setIsMuted] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [volume, setVolume] = useState(0)
   const [userTranscript, setUserTranscript] = useState('')
   const [assistantTranscript, setAssistantTranscript] = useState('')
+  const [liveTurns, setLiveTurns] = useState<LiveTurn[]>([])
   const [statusChips, setStatusChips] = useState<string[]>([])
   const [micPermission, setMicPermission] = useState<'granted' | 'denied' | 'prompt'>('prompt')
   const [connectionQuality, setConnectionQuality] = useState<'good' | 'weak' | 'reconnecting'>('good')
 
   const clientRef = useRef<PipecatClient | null>(null)
-  const threadIdRef = useRef(`thread-${Date.now()}`)
   const mutedRef = useRef(false)
   const pausedRef = useRef(false)
 
   const makeClient = useCallback(() => {
     const transport = new WebSocketTransport({
-      wsUrl: voiceUrl(threadIdRef.current),
+      wsUrl: voiceUrl(getThreadId()),
       recorderSampleRate: INPUT_SAMPLE_RATE,
       playerSampleRate: OUTPUT_SAMPLE_RATE,
     })
@@ -92,15 +109,32 @@ export function useVoiceSession(): IVoiceSession {
           setStatusChips(['Procesando...'])
         },
         onUserTranscript: (data) => {
-          if (data?.text) setUserTranscript(data.text)
+          if (!data?.text) return
+          setUserTranscript(data.text)
+          if (data.final) {
+            const text = data.text
+            setLiveTurns((previous) => [
+              ...previous,
+              { id: `u-${Date.now()}-${previous.length}`, role: 'user', text },
+            ])
+          }
         },
         onBotLlmStarted: () => {
           setAssistantTranscript('')
+          setLiveTurns((previous) => [
+            ...previous,
+            { id: `a-${Date.now()}-${previous.length}`, role: 'assistant', text: '' },
+          ])
         },
         onBotLlmText: (data) => {
-          if (data?.text) {
-            setAssistantTranscript((previous) => previous + data.text)
-          }
+          if (!data?.text) return
+          const text = data.text
+          setAssistantTranscript((previous) => previous + text)
+          setLiveTurns((previous) => {
+            const last = previous[previous.length - 1]
+            if (!last || last.role !== 'assistant') return previous
+            return [...previous.slice(0, -1), { ...last, text: last.text + text }]
+          })
         },
         onBotStartedSpeaking: () => {
           setState('speaking')
@@ -133,15 +167,17 @@ export function useVoiceSession(): IVoiceSession {
     clientRef.current = client
     setUserTranscript('')
     setAssistantTranscript('')
+    setLiveTurns([])
     setStatusChips(['Conectando...'])
 
     try {
       await client.connect()
     } catch (error) {
       console.error('Error starting voice session:', error)
-      setMicPermission('denied')
+      const micProblem = isMicError(error)
+      if (micProblem) setMicPermission('denied')
       setConnectionQuality('weak')
-      setStatusChips(['No se pudo conectar'])
+      setStatusChips([micProblem ? 'Micrófono no disponible' : 'No se pudo conectar al servidor'])
       setState('idle')
       clientRef.current = null
       try {
@@ -192,11 +228,6 @@ export function useVoiceSession(): IVoiceSession {
     setStatusChips(['Interrumpido'])
   }, [])
 
-  const switchToChat = useCallback(() => {
-    stop()
-    navigate({ to: '/chat' })
-  }, [navigate, stop])
-
   useEffect(() => {
     return () => {
       const client = clientRef.current
@@ -216,6 +247,7 @@ export function useVoiceSession(): IVoiceSession {
     volume,
     userTranscript,
     assistantTranscript,
+    liveTurns,
     statusChips,
     micPermission,
     connectionQuality,
@@ -224,6 +256,5 @@ export function useVoiceSession(): IVoiceSession {
     toggleMute,
     togglePause,
     interrupt,
-    switchToChat,
   }
 }

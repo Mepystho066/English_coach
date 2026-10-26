@@ -12,12 +12,13 @@ from fastapi.staticfiles import StaticFiles
 
 from app.agents.coach import build_coach_agent
 from app.agents.model import build_model
-from app.api.routes import chat, health, voice
+from app.api.routes import chat, health, threads, voice
 from app.core.config import Settings, settings as default_settings
 from app.core.logging import configure_logging, get_logger
-from app.sessions.store import InMemorySessionStore
+from app.sessions.store import InMemorySessionStore, SqliteSessionStore
 
-_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_STATIC_DIR = _BACKEND_DIR / "static"
 
 
 @asynccontextmanager
@@ -27,10 +28,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     config: Settings = app.state.settings
     app.state.agent = build_coach_agent(build_model(config))
-    app.state.store = InMemorySessionStore(
-        ttl_seconds=config.session.ttl_seconds,
-        max_messages=config.session.max_turns * 2,
-    )
+    max_messages = config.session.max_turns * 2
+    if config.session.db_path.strip():
+        db_path = Path(config.session.db_path)
+        if not db_path.is_absolute():
+            db_path = _BACKEND_DIR / db_path
+        app.state.store = SqliteSessionStore(db_path, max_messages=max_messages)
+        logger.info("Session history persisted in %s", db_path)
+    else:
+        app.state.store = InMemorySessionStore(
+            ttl_seconds=config.session.ttl_seconds, max_messages=max_messages
+        )
+        logger.info("Session history kept in memory (ttl=%ss)", config.session.ttl_seconds)
 
     logger.info(
         "LLM ready (provider=%s, local=%s @ %s, openrouter=%s)",
@@ -88,6 +97,7 @@ def create_app(config: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(chat.router, prefix="/api/v1")
     app.include_router(voice.router, prefix="/api/v1")
+    app.include_router(threads.router, prefix="/api/v1")
 
     if _STATIC_DIR.is_dir():
         app.mount(
