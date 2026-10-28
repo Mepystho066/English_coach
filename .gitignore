@@ -1,0 +1,52 @@
+# OS / Editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Python packaging / build
+build/
+dist/
+
+# Caches / tests / coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
+.npm/
+.cache/
+
+# Frontend build artifacts
+*.tsbuildinfo
+
+# Backend runtime / data / generated
+data/
+backend/data/
+/static/
+backend/static/
+
+# Logs
+*.log
