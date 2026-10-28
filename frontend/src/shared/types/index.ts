@@ -35,3 +35,4 @@ export interface Conversation {
   lastMessage: string
   updatedAt: number
 }
+export * from './learning'

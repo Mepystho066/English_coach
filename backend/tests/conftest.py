@@ -16,6 +16,7 @@ from app.core.config import (
     AppSettings,
     AssemblyAISettings,
     ElevenLabsSettings,
+    LearningSettings,
     LLMSettings,
     OpenRouterSettings,
     SessionSettings,
@@ -56,6 +57,8 @@ def test_settings() -> Settings:
         ),
         voice=VoiceSettings(_env_file=None),
         session=SessionSettings(_env_file=None),
+        # The analyzer is a separate model call; tests turn it on explicitly.
+        learning=LearningSettings(_env_file=None, enabled=False),
         app=AppSettings(_env_file=None),
     )
 

@@ -46,6 +46,7 @@ async def voice(websocket: WebSocket, thread_id: str) -> None:
             config=config,
             store=store,
             thread_id=thread_id,
+            learning=websocket.app.state.learning,
         )
     except WebSocketDisconnect:
         logger.debug("Voice client disconnected (thread=%s)", thread_id)

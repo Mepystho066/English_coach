@@ -63,7 +63,8 @@ Todas las secciones usan prefijos y están documentadas en `env-example.txt`.
 | AssemblyAI | `ASSEMBLYAI_` | `API_KEY`, `SPEECH_MODEL`, `ENCODING`, `MIN_TURN_SILENCE`, `MAX_TURN_SILENCE`, `END_OF_TURN_CONFIDENCE_THRESHOLD` |
 | ElevenLabs | `ELEVENLABS_` | `API_KEY`, `VOICE_ID`, `MODEL_ID`, `OUTPUT_FORMAT`, `BASE_URL` |
 | Voz | `VOICE_` | `MAX_SESSION_SECONDS`, `INPUT_SAMPLE_RATE` |
-| Sesiones | `SESSION_` | `TTL_SECONDS`, `MAX_TURNS` |
+| Sesiones | `SESSION_` | `TTL_SECONDS`, `MAX_TURNS`, `DB_PATH` |
+| Aprendizaje | `LEARNING_` | `ENABLED`, `TIMEOUT`, `MAX_CORRECTIONS`, `MAX_VOCABULARY` |
 | App | `APP_` | `ENV`, `LOG_LEVEL`, `CORS_ORIGINS` |
 
 `.env` está en `.gitignore`. **Nunca** subas claves al repositorio; si una se
@@ -100,13 +101,48 @@ de `OPEN_ROUTER`.
 > voz larga los agota. En el chat, un 429 **a mitad de stream** no se puede
 > reintentar en el modelo local: ese turno termina con `agent_error`.
 
+## Correcciones, vocabulario y progreso
+
+Cada mensaje del alumno (texto o voz) se analiza **en paralelo**, sin retrasar
+la respuesta del coach, con un segundo `Agent` de pydantic-ai y salida
+estructurada (`NativeOutput`). El prompt vive en `app/prompts/analyzer.md`.
+
+- Devuelve como mucho dos correcciones y dos palabras por turno. Las
+  explicaciones van en español.
+- El chat emite un evento AG-UI `STATE_SNAPSHOT` antes de `RUN_FINISHED`; si el
+  análisis tarda más que la espera corta del stream, el cliente consulta
+  `GET /api/v1/threads/{id}/state` hasta que aparece.
+- En voz, el servidor manda un mensaje RTVI `server-message` con
+  `{type: "learning-state", state}` después de cada turno del asistente.
+- El estado se guarda por `thread_id` en la misma base SQLite que el historial
+  (tabla `learning`) y se reutiliza entre canales.
+- Con `LLM_PROVIDER=fallback` el analizador usa **solo el modelo local**, para no
+  gastar el cupo gratuito de OpenRouter con una llamada extra por turno.
+- `LEARNING_TIMEOUT` (60 s por defecto) evita que un modelo local lento deje una
+  tarea colgada. Un mensaje de una sola palabra no se analiza; el turno cuenta
+  igual.
+
 ## Endpoints
 
 ### `POST /api/v1/chat`
 
 Cuerpo `RunAgentInput` de AG-UI; respuesta `text/event-stream` de eventos AG-UI.
 El historial se guarda en el servidor por `threadId` (el historial que envíe el
-cliente tiene prioridad en ese turno).
+cliente tiene prioridad en ese turno). Antes de `RUN_FINISHED` llega un
+`STATE_SNAPSHOT` con las correcciones, el vocabulario y el progreso.
+
+### `GET /api/v1/threads/{thread_id}/messages`
+
+Historial `[{role, content}]` guardado para el hilo, compartido por chat y voz.
+
+### `GET /api/v1/threads/{thread_id}/state`
+
+Correcciones, vocabulario y progreso del hilo. Devuelve un estado vacío para
+hilos desconocidos.
+
+### `DELETE /api/v1/threads/{thread_id}`
+
+Borra historial y estado de aprendizaje (botón "Nueva" de la UI). `204`.
 
 ### `WS /api/v1/voice/{thread_id}`
 
@@ -119,7 +155,8 @@ con `FastAPIWebsocketTransport` + `ProtobufFrameSerializer`.
   `client-message` con `type: "interrupt"` para el botón de interrupción.
 - **Servidor → cliente**: audio PCM16 a la tasa de `ELEVENLABS_OUTPUT_FORMAT`
   (24 kHz con `pcm_24000`) y eventos RTVI (`user-transcript`,
-  `bot-llm-text`, `bot-started-speaking`, `bot-stopped-speaking`, …).
+  `bot-llm-text`, `bot-started-speaking`, `bot-stopped-speaking`, …), más un
+  `server-message` con `{type: "learning-state", state}` tras cada turno.
 
 El cliente fija esas dos tasas en
 `frontend/src/shared/hooks/useVoiceSession.ts` (`INPUT_SAMPLE_RATE` y
@@ -159,23 +196,33 @@ app/
 │   └── routes/
 │       ├── health.py
 │       ├── chat.py          # POST /api/v1/chat  (AG-UI)
+│       ├── threads.py       # historial + estado de aprendizaje
 │       └── voice.py         # WS   /api/v1/voice/{thread_id} (Pipecat/RTVI)
 ├── agents/
 │   ├── model.py             # build_model()  (local + OpenRouter, fallback)
 │   ├── deps.py              # AgentDeps
 │   └── coach.py             # build_coach_agent()
-├── prompts/English_coach.md # instrucciones del agente
+├── learning/
+│   ├── models.py            # LearningState, Correction, VocabularyItem
+│   ├── analyzer.py          # segundo Agent + salida estructurada
+│   ├── service.py           # analiza, fusiona y calcula el progreso
+│   └── store.py             # persistencia por thread_id
+├── prompts/
+│   ├── coach.md             # instrucciones del agente
+│   └── analyzer.md          # instrucciones del analizador
 ├── services/
 │   └── voice/
 │       ├── pipecat_pipeline.py  # transporte, servicios y PipelineTask
 │       ├── llm.py               # selección local / OpenRouter / fallback
 │       └── history.py           # SessionStore ⇄ contexto de Pipecat
-└── sessions/store.py        # SessionStore + InMemorySessionStore
+└── sessions/store.py        # SessionStore, InMemory + SQLite
 ```
 
-`sessions/store.py` define un `Protocol`: cambiar a Redis o SQLite no requiere
-tocar rutas ni el pipeline. El historial se comparte entre chat y voz; los
-mensajes de Pipecat se convierten a `ModelMessage` al cerrar la sesión.
+`sessions/store.py` y `learning/store.py` definen sendos `Protocol`: cambiar a
+Redis no requiere tocar rutas ni el pipeline. El historial se comparte entre
+chat y voz; los mensajes de Pipecat se convierten a `ModelMessage` al cerrar la
+sesión. Con `SESSION_DB_PATH` definido, historial y aprendizaje se guardan en
+SQLite (`backend/data/sessions.db` por defecto); si está vacío, en memoria.
 
 ## Notas de diseño
 
@@ -186,9 +233,9 @@ mensajes de Pipecat se convierten a `ModelMessage` al cerrar la sesión.
 - **Contexto entre canales**: al abrir la sesión de voz se siembra el
   `LLMContext` con las instrucciones y el historial del `thread_id`; al cerrar se
   vuelve a guardar. Así una conversación puede empezar en chat y seguir por voz.
-- **TTS**: ElevenLabs recibe el texto según lo emite el LLM; Pipecat decide los
-  límites de agregación y usa `auto_mode` para minimizar el tiempo al primer
-  byte. El formato de salida sale de `ELEVENLABS_OUTPUT_FORMAT`.
+- **TTS**: `ElevenLabsDialogueTTSService` (modelos Eleven v3/v4) recibe el texto
+  agregado por frases; la tasa de salida se pasa explícitamente desde
+  `ELEVENLABS_OUTPUT_FORMAT` para que coincida con la que anuncia el transporte.
 - **Persistencia**: el historial de voz se guarda al cerrar la sesión (o al
   alcanzar `VOICE_MAX_SESSION_SECONDS`). Los turnos son texto; las llamadas a la
   tool `get_current_datetime` no se replican porque son stateless.

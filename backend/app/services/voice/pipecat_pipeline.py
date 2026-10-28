@@ -38,13 +38,13 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.processors.frameworks.rtvi import RTVIProcessor
+from pipecat.processors.frameworks.rtvi import RTVIProcessor, RTVIServerMessageFrame
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.services.assemblyai.stt import (
     AssemblyAISTTService,
     AssemblyAISTTSettings,
 )
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.elevenlabs.dialogue.tts import ElevenLabsDialogueTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
@@ -55,10 +55,11 @@ from pydantic_ai.messages import ModelMessage
 
 from app.agents.coach import load_instructions
 from app.core.config import Settings
+from app.learning.service import LearningService
 from app.services.voice.history import to_llm_messages, to_model_messages
 from app.services.voice.llm import build_voice_llm
 from app.sessions.store import SessionStore
-from pipecat.services.elevenlabs.dialogue.tts import ElevenLabsDialogueTTSService
+
 logger = logging.getLogger(__name__)
 
 GET_DATETIME_TOOL = FunctionSchema(
@@ -123,35 +124,20 @@ def build_stt(config: Settings) -> AssemblyAISTTService:
 
 
 def build_tts(config: Settings) -> ElevenLabsDialogueTTSService:
-
+    """Build the ElevenLabs Text-to-Dialogue service (Eleven v3/v4 models)."""
     if not config.elevenlabs.is_configured:
-        ValueError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be set")
+        raise ValueError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be set")
     return ElevenLabsDialogueTTSService(
         api_key=config.elevenlabs.api_key.get_secret_value(),
+        url=config.elevenlabs.base_url,
+        sample_rate=config.elevenlabs.sample_rate,
         settings=ElevenLabsDialogueTTSService.Settings(
             voice=config.elevenlabs.voice_id,
-            model=config.elevenlabs.model_id,   # ← hardcodeado
+            model=config.elevenlabs.model_id,
             stability=0.5,
         ),
     )
 
-def build_tts_v1(config: Settings) -> ElevenLabsTTSService:
-    """Build the streaming ElevenLabs TTS service.
-
-    Respects ``ELEVENLABS_*`` settings: ``API_KEY``, ``VOICE_ID``, ``MODEL_ID``,
-    ``OUTPUT_FORMAT`` (drives sample rate) and ``BASE_URL``.
-    """
-    if not config.elevenlabs.is_configured:
-        raise ValueError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be set")
-    return ElevenLabsTTSService(
-        api_key=config.elevenlabs.api_key.get_secret_value(),
-        url=config.elevenlabs.base_url,
-        sample_rate=config.elevenlabs.sample_rate,
-        settings=ElevenLabsTTSService.Settings(
-            voice=config.elevenlabs.voice_id,
-            model=config.elevenlabs.model_id,
-        ),
-    )
 
 def build_context(history: list[ModelMessage]) -> LLMContext:
     """Build the LLM context seeded with instructions and prior turns."""
@@ -167,7 +153,7 @@ def build_pipeline(
     transport: FastAPIWebsocketTransport,
     stt: AssemblyAISTTService,
     llm: Any,
-    tts: ElevenLabsTTSService,
+    tts: ElevenLabsDialogueTTSService,
     context: LLMContext,
     config: Settings,
 ) -> tuple[Pipeline, LLMContextAggregatorPair]:
@@ -202,6 +188,7 @@ async def run_voice_session(
     config: Settings,
     store: SessionStore,
     thread_id: str,
+    learning: LearningService | None = None,
 ) -> None:
     """Run one voice conversation until the client leaves or the cap is hit."""
     history = await store.get_history(thread_id)
@@ -212,7 +199,7 @@ async def run_voice_session(
     tts = build_tts(config)
     context = build_context(history)
 
-    pipeline, _ = build_pipeline(
+    pipeline, aggregators = build_pipeline(
         transport=transport,
         stt=stt,
         llm=llm,
@@ -247,6 +234,44 @@ async def run_voice_session(
         if message.type == "interrupt":
             await worker.queue_frames([InterruptionFrame()])
 
+    analysis_tasks: set[asyncio.Task] = set()
+    pending_user_turns: list[str] = []
+
+    async def _analyze_and_push(text: str) -> None:
+        try:
+            state = await learning.record_turn(thread_id, text)  # type: ignore[union-attr]
+            if state is not None:
+                await worker.queue_frames(
+                    [
+                        RTVIServerMessageFrame(
+                            data={
+                                "type": "learning-state",
+                                "state": state.model_dump(mode="json"),
+                            }
+                        )
+                    ]
+                )
+        except Exception:
+            logger.exception("Learning analysis failed (thread=%s)", thread_id)
+
+    if learning is not None and learning.enabled:
+
+        @aggregators.user().event_handler("on_user_turn_stopped")
+        async def _on_user_turn_stopped(_aggregator, _strategy, message) -> None:
+            if message.content:
+                pending_user_turns.append(message.content)
+
+        # Analyze once the coach has finished its turn, so the extra model call
+        # never competes with the reply the learner is waiting for.
+        @aggregators.assistant().event_handler("on_assistant_turn_stopped")
+        async def _on_assistant_turn_stopped(_aggregator, _message) -> None:
+            turns = pending_user_turns[:]
+            pending_user_turns.clear()
+            for text in turns:
+                task = asyncio.create_task(_analyze_and_push(text))
+                analysis_tasks.add(task)
+                task.add_done_callback(analysis_tasks.discard)
+
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)
     try:
@@ -259,6 +284,8 @@ async def run_voice_session(
             thread_id,
         )
     finally:
+        # Analyses already running are left to finish: the last turn matters
+        # most, and the state store outlives the voice session.
         await store.set_history(
             thread_id, to_model_messages(context.get_messages())
         )

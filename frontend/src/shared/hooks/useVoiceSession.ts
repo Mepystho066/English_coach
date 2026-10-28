@@ -3,12 +3,18 @@ import { PipecatClient, TransportState } from '@pipecat-ai/client-js'
 import { WebSocketTransport } from '@pipecat-ai/websocket-transport'
 import { env } from '@/core/config/env'
 import { VoiceSessionState } from '@/shared/types'
+import { LearningState, toLearningState } from '@/shared/types/learning'
 import { getThreadId } from '@/shared/lib/thread'
 
 export interface LiveTurn {
   id: string
   role: 'user' | 'assistant'
   text: string
+}
+
+export interface VoiceSessionOptions {
+  /** Called when the server sends the learning state for a finished turn. */
+  onLearningState?: (state: LearningState) => void
 }
 
 export interface IVoiceSession {
@@ -50,7 +56,7 @@ function isMicError(error: unknown): boolean {
   )
 }
 
-export function useVoiceSession(): IVoiceSession {
+export function useVoiceSession(options: VoiceSessionOptions = {}): IVoiceSession {
   const [state, setState] = useState<VoiceSessionState>('idle')
   const [isMuted, setIsMuted] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
@@ -65,6 +71,11 @@ export function useVoiceSession(): IVoiceSession {
   const clientRef = useRef<PipecatClient | null>(null)
   const mutedRef = useRef(false)
   const pausedRef = useRef(false)
+  const learningHandler = useRef(options.onLearningState)
+
+  useEffect(() => {
+    learningHandler.current = options.onLearningState
+  }, [options.onLearningState])
 
   const makeClient = useCallback(() => {
     const transport = new WebSocketTransport({
@@ -143,6 +154,10 @@ export function useVoiceSession(): IVoiceSession {
         onBotStoppedSpeaking: () => {
           setState('listening')
           setStatusChips(['Escuchando...'])
+        },
+        onServerMessage: (data) => {
+          if (data?.type !== 'learning-state') return
+          learningHandler.current?.(toLearningState(data.state))
         },
         onLocalAudioLevel: (level) => {
           // The transport reports 0..1; smooth it a little for the orb.

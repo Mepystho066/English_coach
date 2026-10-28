@@ -15,6 +15,7 @@ from app.agents.model import build_model
 from app.api.routes import chat, health, threads, voice
 from app.core.config import Settings, settings as default_settings
 from app.core.logging import configure_logging, get_logger
+from app.learning.service import build_learning_service
 from app.sessions.store import InMemorySessionStore, SqliteSessionStore
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     config: Settings = app.state.settings
     app.state.agent = build_coach_agent(build_model(config))
     max_messages = config.session.max_turns * 2
+    db_path: Path | None = None
     if config.session.db_path.strip():
         db_path = Path(config.session.db_path)
         if not db_path.is_absolute():
@@ -40,6 +42,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ttl_seconds=config.session.ttl_seconds, max_messages=max_messages
         )
         logger.info("Session history kept in memory (ttl=%ss)", config.session.ttl_seconds)
+
+    app.state.learning = build_learning_service(config, db_path)
+    if app.state.learning.enabled:
+        where = "OpenRouter" if config.llm.provider == "openrouter" else "local model"
+        logger.info("Learning analysis enabled (%s)", where)
+    else:
+        logger.info("Learning analysis disabled")
 
     logger.info(
         "LLM ready (provider=%s, local=%s @ %s, openrouter=%s)",
@@ -67,6 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await app.state.store.aclose()
+        await app.state.learning.aclose()
 
 
 def create_app(config: Settings | None = None) -> FastAPI:

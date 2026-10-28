@@ -67,6 +67,13 @@ SESSION_MAX_TURNS=100
 # SQLite file for history that survives restarts (empty = in memory)
 SESSION_DB_PATH=data/sessions.db
 
+# --- Learning (corrections, vocabulary, progress) ---------------------------
+# One extra model call per learner turn. With LLM_PROVIDER=fallback it runs on
+# the local model only, so it never spends the OpenRouter free quota.
+LEARNING_ENABLED=true
+# Seconds before a slow analysis is dropped (local reasoning models: 10-30 s).
+LEARNING_TIMEOUT=60
+
 # --- HTTP -------------------------------------------------------------------
 APP_ENV=development
 APP_LOG_LEVEL=INFO

@@ -1,21 +1,33 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { ChatMessage } from '@/shared/types'
+import { EMPTY_LEARNING, LearningState, toLearningState } from '@/shared/types/learning'
 import { env } from '@/core/config/env'
 import { getThreadId, resetThreadId } from '@/shared/lib/thread'
 
 export interface IChatRuntime {
   messages: ChatMessage[]
+  learning: LearningState
   isSending: boolean
   isLoadingHistory: boolean
   sendMessage: (content: string) => Promise<void>
   resetConversation: () => Promise<void>
   refresh: () => Promise<void>
+  /** Replace the learning state (used for updates that arrive by voice). */
+  applyLearning: (state: LearningState) => void
 }
 
 interface StoredMessage {
   role: 'user' | 'assistant'
   content: string
 }
+
+// The analysis runs on the server a few seconds after the reply.
+const POLL_INTERVAL_MS = 3000
+// Local reasoning models can take a while, and the user can also reload the
+// panel to pick the state up once it lands.
+const POLL_MAX_TRIES = 30
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function greeting(): ChatMessage {
   return {
@@ -29,10 +41,20 @@ function greeting(): ChatMessage {
 export function useChatRuntime(): IChatRuntime {
   const [threadId, setThreadId] = useState(getThreadId)
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [learning, setLearning] = useState<LearningState>(EMPTY_LEARNING)
   const [isSending, setIsSending] = useState(false)
   const [isLoadingHistory, setIsLoadingHistory] = useState(true)
 
-  const isSendingRef = useRef(false)
+  // True while a reply is streaming: history reloads must not overwrite it.
+  const streamingRef = useRef(false)
+  const learningRef = useRef<LearningState>(EMPTY_LEARNING)
+  // Bumped when the conversation changes, to stop a poll that is still running.
+  const pollGeneration = useRef(0)
+
+  const applyLearning = useCallback((state: LearningState) => {
+    learningRef.current = state
+    setLearning(state)
+  }, [])
 
   const loadHistory = useCallback(async (): Promise<StoredMessage[] | null> => {
     try {
@@ -44,6 +66,19 @@ export function useChatRuntime(): IChatRuntime {
       return body.messages
     } catch (error) {
       console.error('Error loading history:', error)
+      return null
+    }
+  }, [threadId])
+
+  const loadLearning = useCallback(async (): Promise<LearningState | null> => {
+    try {
+      const response = await fetch(
+        `${env.API_URL}/api/v1/threads/${encodeURIComponent(threadId)}/state`,
+      )
+      if (!response.ok) throw new Error(`State error: ${response.status}`)
+      return toLearningState(await response.json())
+    } catch (error) {
+      console.error('Error loading learning state:', error)
       return null
     }
   }, [threadId])
@@ -64,23 +99,48 @@ export function useChatRuntime(): IChatRuntime {
 
   useEffect(() => {
     let cancelled = false
+    pollGeneration.current += 1
     setIsLoadingHistory(true)
-    loadHistory().then((stored) => {
+    applyLearning(EMPTY_LEARNING)
+
+    Promise.all([loadHistory(), loadLearning()]).then(([stored, state]) => {
       if (cancelled) return
       applyHistory(stored)
+      if (state) applyLearning(state)
       setIsLoadingHistory(false)
     })
     return () => {
       cancelled = true
     }
-  }, [loadHistory, applyHistory])
+  }, [loadHistory, loadLearning, applyHistory, applyLearning])
 
   /** Reload the stored conversation (e.g. after a voice call ends). */
   const refresh = useCallback(async () => {
-    const stored = await loadHistory()
+    const [stored, state] = await Promise.all([loadHistory(), loadLearning()])
+    if (state) applyLearning(state)
     // Never replace the list while a reply is streaming in.
-    if (stored && !isSendingRef.current) applyHistory(stored)
-  }, [loadHistory, applyHistory])
+    if (stored && !streamingRef.current) applyHistory(stored)
+  }, [loadHistory, loadLearning, applyHistory, applyLearning])
+
+  /** Wait for the server to finish analyzing the message just sent. */
+  const waitForAnalysis = useCallback(
+    async (turnsBefore: number) => {
+      const generation = pollGeneration.current
+      for (let attempt = 0; attempt < POLL_MAX_TRIES; attempt += 1) {
+        await sleep(POLL_INTERVAL_MS)
+        if (generation !== pollGeneration.current) return
+        if (learningRef.current.turns > turnsBefore) return
+        const state = await loadLearning()
+        if (generation !== pollGeneration.current) return
+        if (state && state.turns > turnsBefore) {
+          applyLearning(state)
+          return
+        }
+        if (state && !state.enabled) return
+      }
+    },
+    [loadLearning, applyLearning],
+  )
 
   const sendMessage = useCallback(async (content: string) => {
     if (!content.trim() || isSending) return
@@ -92,8 +152,11 @@ export function useChatRuntime(): IChatRuntime {
       timestamp: Date.now(),
     }
     setMessages((prev) => [...prev, userMessage])
-    isSendingRef.current = true
+    streamingRef.current = true
     setIsSending(true)
+
+    const turnsBefore = learningRef.current.turns
+    let gotSnapshot = false
 
     try {
       const response = await fetch(`${env.API_URL}/api/v1/chat`, {
@@ -129,17 +192,27 @@ export function useChatRuntime(): IChatRuntime {
         if (!line.startsWith('data: ')) return
         try {
           const data = JSON.parse(line.slice(6))
-          if (data.type === 'TEXT_MESSAGE_CONTENT') {
+          if (data.type === 'TEXT_MESSAGE_START') {
+            assistantContent = ''
+          } else if (data.type === 'TEXT_MESSAGE_CONTENT') {
             assistantContent += data.delta
           } else if (data.type === 'TEXT_MESSAGE_END') {
-            const assistantMessage: ChatMessage = {
-              id: (Date.now() + 1).toString(),
-              role: 'assistant',
-              content: assistantContent,
-              timestamp: Date.now(),
+            // Models often open with an empty message before calling a tool.
+            if (assistantContent.trim()) {
+              const assistantMessage: ChatMessage = {
+                id: (Date.now() + 1).toString(),
+                role: 'assistant',
+                content: assistantContent,
+                timestamp: Date.now(),
+              }
+              setMessages((prev) => [...prev, assistantMessage])
+              // The reply is in; what is left on the stream is bookkeeping.
+              setIsSending(false)
             }
-            setMessages((prev) => [...prev, assistantMessage])
             assistantContent = ''
+          } else if (data.type === 'STATE_SNAPSHOT') {
+            gotSnapshot = true
+            applyLearning(toLearningState(data.snapshot))
           }
         } catch {
           // Skip invalid JSON
@@ -169,12 +242,16 @@ export function useChatRuntime(): IChatRuntime {
       }
       setMessages((prev) => [...prev, errorMessage])
     } finally {
-      isSendingRef.current = false
+      streamingRef.current = false
       setIsSending(false)
     }
-  }, [isSending, threadId])
+
+    // The analysis usually finishes after the stream closes: poll for it.
+    if (!gotSnapshot) await waitForAnalysis(turnsBefore)
+  }, [isSending, threadId, applyLearning, waitForAnalysis])
 
   const resetConversation = useCallback(async () => {
+    pollGeneration.current += 1
     try {
       await fetch(`${env.API_URL}/api/v1/threads/${encodeURIComponent(threadId)}`, {
         method: 'DELETE',
@@ -182,15 +259,18 @@ export function useChatRuntime(): IChatRuntime {
     } catch (error) {
       console.error('Error clearing conversation:', error)
     }
+    applyLearning(EMPTY_LEARNING)
     setThreadId(resetThreadId())
-  }, [threadId])
+  }, [threadId, applyLearning])
 
   return {
     messages,
+    learning,
     isSending,
     isLoadingHistory,
     sendMessage,
     resetConversation,
     refresh,
+    applyLearning,
   }
 }

@@ -208,6 +208,20 @@ class SessionSettings(BaseSettings):
     db_path: str = ""
 
 
+class LearningSettings(BaseSettings):
+    """Corrections, vocabulary and progress extracted from the learner's turns."""
+
+    model_config = SettingsConfigDict(env_prefix="LEARNING_", **_BASE_CONFIG)
+
+    enabled: bool = True
+    # The analyzer runs beside the coach and never blocks its reply. Local
+    # reasoning models can take 10-30 s, so the result is only dropped after
+    # this many seconds.
+    timeout: float = 60.0
+    max_corrections: int = 200
+    max_vocabulary: int = 300
+
+
 class AppSettings(BaseSettings):
     """HTTP/app-level settings."""
 
@@ -243,6 +257,7 @@ class Settings(BaseSettings):
     elevenlabs: ElevenLabsSettings = Field(default_factory=ElevenLabsSettings)
     voice: VoiceSettings = Field(default_factory=VoiceSettings)
     session: SessionSettings = Field(default_factory=SessionSettings)
+    learning: LearningSettings = Field(default_factory=LearningSettings)
     app: AppSettings = Field(default_factory=AppSettings)
 
 

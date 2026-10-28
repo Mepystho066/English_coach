@@ -7,6 +7,7 @@ from pydantic_ai import Agent
 
 from app.agents.deps import AgentDeps
 from app.core.config import Settings
+from app.learning.service import LearningService
 from app.sessions.store import SessionStore
 
 
@@ -20,3 +21,7 @@ def get_agent(request: Request) -> Agent[AgentDeps, str]:
 
 def get_store(request: Request) -> SessionStore:
     return request.app.state.store
+
+
+def get_learning(request: Request) -> LearningService:
+    return request.app.state.learning

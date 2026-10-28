@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Response
 
-from app.api.deps import get_store
+from app.api.deps import get_learning, get_store
+from app.learning.models import LearningState
+from app.learning.service import LearningService
 from app.services.voice.history import to_llm_messages
 from app.sessions.store import SessionStore
 
@@ -20,10 +22,21 @@ async def list_messages(
     return {"threadId": thread_id, "messages": to_llm_messages(history)}
 
 
+@router.get("/{thread_id}/state")
+async def get_state(
+    thread_id: str, learning: LearningService = Depends(get_learning)
+) -> LearningState:
+    """Corrections, vocabulary and progress collected for a thread."""
+    return await learning.get_state(thread_id)
+
+
 @router.delete("/{thread_id}", status_code=204)
 async def delete_thread(
-    thread_id: str, store: SessionStore = Depends(get_store)
+    thread_id: str,
+    store: SessionStore = Depends(get_store),
+    learning: LearningService = Depends(get_learning),
 ) -> Response:
-    """Forget a thread's history (the "new conversation" button)."""
+    """Forget a thread's history and learning state ("new conversation")."""
     await store.clear(thread_id)
+    await learning.clear(thread_id)
     return Response(status_code=204)

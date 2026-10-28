@@ -13,6 +13,9 @@ import { useChatRuntime } from '@/shared/hooks/useChatRuntime'
 const HISTORY_SETTLE_MS = 1200
 
 export function VoicePage() {
+  const chat = useChatRuntime()
+  const { refresh, applyLearning } = chat
+
   const {
     state,
     isMuted,
@@ -29,9 +32,7 @@ export function VoicePage() {
     toggleMute,
     togglePause,
     interrupt,
-  } = useVoiceSession()
-  const chat = useChatRuntime()
-  const { refresh } = chat
+  } = useVoiceSession({ onLearningState: applyLearning })
 
   const [isChatOpen, setIsChatOpen] = useState(false)
   const [showLive, setShowLive] = useState(false)
@@ -111,6 +112,7 @@ export function VoicePage() {
         open={isChatOpen}
         onClose={() => setIsChatOpen(false)}
         messages={chat.messages}
+        learning={chat.learning}
         liveTurns={showLive ? liveTurns : []}
         isSending={chat.isSending}
         isLoadingHistory={chat.isLoadingHistory}
