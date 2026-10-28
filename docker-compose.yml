@@ -26,7 +26,7 @@ services:
       UV_PROJECT_ENVIRONMENT: /venv
       UV_LINK_MODE: copy
       # Las variables de entorno tienen prioridad sobre backend/.env.
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://192.168.0.50:1234/v1}
       SESSION_DB_PATH: /data/sessions.db
       PYTHONUNBUFFERED: "1"
     extra_hosts:
